@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "icd10-mcp"
+version = "0.1.0"
+description = "ICD-10-CM coding MCP server — stdio + HTTP/SSE transport"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    # MCP framework
+    "mcp>=1.0.0",
+
+    # HTTP/SSE transport
+    "starlette>=0.37.0",
+    "uvicorn>=0.29.0",
+
+    # Pinecone vector DB
+    "pinecone>=3.0.0",
+
+    # Numerics (embedder)
+    "numpy>=1.24.0",
+
+    # HTTP client (OpenRouter calls)
+    "requests>=2.31.0",
+
+    # Environment variables
+    "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+icd10-mcp = "icd10_mcp.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+icd10_mcp = ["py.typed"]

@@ -1,0 +1,32 @@
+# Environment variables — NEVER commit real keys
+.env
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Data files — too large and not needed on Render
+scripts/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# uv
+uv.lock
+.python-version
+
+# Local-only files
+Dockerfile
+main.py
+claude_desktop_config.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
