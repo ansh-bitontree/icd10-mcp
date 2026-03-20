@@ -14,9 +14,6 @@ services:
       - key: OPENROUTER_API_KEY
         sync: false
 
-      - key: MCP_API_KEY
-        sync: false
-
       - key: PINECONE_INDEX_NAME
         value: icd10cm-2026
 

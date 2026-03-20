@@ -42,39 +42,44 @@ from icd10_mcp.planner import plan_queries
 from icd10_mcp.retriever import embed_text, get_index, pinecone_query, retrieve_all_candidates
 from icd10_mcp.selector import select_codes
 
-# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
 
-# ── Load .env (local dev only — Render injects env vars directly) ─────────────
 load_dotenv()
 
 # ── Config ────────────────────────────────────────────────────────────────────
 PINECONE_API_KEY   = os.environ["PINECONE_API_KEY"]
 PINECONE_INDEX     = os.getenv("PINECONE_INDEX_NAME", "icd10cm-2026")
 PINECONE_NAMESPACE = os.getenv("PINECONE_NAMESPACE", "icd10cm_2026")
-OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
+# Server's default OpenRouter key (for local/stdio mode)
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 PLANNER_MODEL      = os.getenv("PLANNER_MODEL", "openai/gpt-4o-mini")
 SELECTOR_MODEL     = os.getenv("SELECTOR_MODEL", "openai/gpt-4o-mini")
 EMBED_MODEL        = os.getenv("EMBED_MODEL", "openai/text-embedding-3-small")
 
-# Callers must send this in X-API-Key header.
-# Generate with: python -c "import secrets; print(secrets.token_hex(32))"
-# Set it in Render dashboard. Leave blank only for local testing.
-MCP_API_KEY = os.getenv("MCP_API_KEY", "")
-
 PORT = int(os.getenv("PORT", "8000"))
+
+# Thread-local storage for per-request OpenRouter API key
+import threading
+_request_context = threading.local()
 
 
 # ── Lazy singletons ───────────────────────────────────────────────────────────
 
-@lru_cache(maxsize=1)
+def _get_openrouter_key() -> str:
+    """Get OpenRouter API key from request context or fallback to server default."""
+    return getattr(_request_context, 'openrouter_key', None) or OPENROUTER_API_KEY
+
+
 def _get_embedder() -> OpenRouterEmbedder:
-    logger.info("Initialising embedder: %s", EMBED_MODEL)
-    return OpenRouterEmbedder(api_key=OPENROUTER_API_KEY, model=EMBED_MODEL)
+    """Create embedder with current request's OpenRouter key."""
+    api_key = _get_openrouter_key()
+    if not api_key:
+        raise ValueError("OpenRouter API key is required. Provide it via X-OpenRouter-API-Key header or set OPENROUTER_API_KEY env var.")
+    return OpenRouterEmbedder(api_key=api_key, model=EMBED_MODEL)
 
 
 @lru_cache(maxsize=1)
@@ -161,10 +166,14 @@ async def _handle_code_clinical_note(args: Dict[str, Any]) -> str:
 
     max_codes: int = int(args.get("max_codes_per_problem", 2))
     logger.info("code_clinical_note: note=%d chars", len(note))
+    
+    api_key = _get_openrouter_key()
+    if not api_key:
+        return json.dumps({"error": "OpenRouter API key is required. Provide it via X-OpenRouter-API-Key header."})
 
     planned_problems = plan_queries(
         note=note,
-        openrouter_api_key=OPENROUTER_API_KEY,
+        openrouter_api_key=api_key,
         model=PLANNER_MODEL,
     )
     if not planned_problems:
@@ -186,7 +195,7 @@ async def _handle_code_clinical_note(args: Dict[str, Any]) -> str:
         note=note,
         planned_problems=planned_problems,
         merged_candidates=merged,
-        openrouter_api_key=OPENROUTER_API_KEY,
+        openrouter_api_key=api_key,
         model=SELECTOR_MODEL,
         max_codes_per_problem=max_codes,
         candidates_by_problem=by_problem,
@@ -249,12 +258,6 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
 
 # ── HTTP / SSE layer ──────────────────────────────────────────────────────────
 
-def _auth_ok(request: Request) -> bool:
-    if not MCP_API_KEY:
-        return True  # open access — local dev only
-    return request.headers.get("X-API-Key", "") == MCP_API_KEY
-
-
 sse = SseServerTransport("/messages/")
 
 
@@ -262,14 +265,16 @@ async def handle_sse(request: Request):
     """
     SSE endpoint — MCP clients connect here.
     GET https://your-app.onrender.com/sse
-    Header: X-API-Key: <your MCP_API_KEY>
+    Header: X-OpenRouter-API-Key: <your OpenRouter API key>
     """
-    if not _auth_ok(request):
-        return JSONResponse(
-            {"error": "Unauthorized — send your key in the X-API-Key header"},
-            status_code=401,
-        )
-    logger.info("New SSE connection from %s", request.client)
+    # Extract OpenRouter API key from request headers
+    openrouter_key = request.headers.get("X-OpenRouter-API-Key", "")
+    if openrouter_key:
+        _request_context.openrouter_key = openrouter_key
+        logger.info("New SSE connection from %s with custom OpenRouter key", request.client)
+    else:
+        logger.info("New SSE connection from %s using server default key", request.client)
+    
     async with sse.connect_sse(
         request.scope, request.receive, request._send
     ) as streams:
@@ -286,7 +291,6 @@ async def handle_health(request: Request):
         "server":  "icd10-mcp",
         "version": "0.1.0",
         "tools":   ["code_clinical_note", "search_icd10"],
-        "auth":    "enabled" if MCP_API_KEY else "disabled (set MCP_API_KEY!)",
     })
 
 

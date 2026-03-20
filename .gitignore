@@ -25,6 +25,8 @@ uv.lock
 Dockerfile
 main.py
 claude_desktop_config.json
+test_connection.py
+DEPLOYMENT.md
 
 # IDE
 .vscode/
