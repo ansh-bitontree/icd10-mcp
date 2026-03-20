@@ -2,15 +2,12 @@ services:
   - type: web
     name: icd10-mcp
     runtime: python
-    pythonVersion: "3.11"
     buildCommand: pip install -e .
     startCommand: python -m icd10_mcp.server --http
     healthCheckPath: /health
     plan: free
 
     envVars:
-      # ── Required: set these in Render dashboard (sync: false = not stored here) ──
-
       - key: PINECONE_API_KEY
         sync: false
 
@@ -19,10 +16,6 @@ services:
 
       - key: MCP_API_KEY
         sync: false
-        # Generate with: python -c "import secrets; print(secrets.token_hex(32))"
-        # Anyone calling your server must send this in the X-API-Key header
-
-      # ── Optional: defaults are fine, change only if needed ───────────────────
 
       - key: PINECONE_INDEX_NAME
         value: icd10cm-2026
@@ -38,5 +31,3 @@ services:
 
       - key: EMBED_MODEL
         value: openai/text-embedding-3-small
-
-      # PORT is injected automatically by Render — do not set it manually
