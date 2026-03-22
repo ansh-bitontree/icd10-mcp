@@ -1,11 +1,15 @@
 {
   "mcpServers": {
     "icd10-mcp": {
-      "url": "https://icd10-mcp.onrender.com/sse",
-      "transport": "sse",
-      "headers": {
-        "X-OpenRouter-API-Key": "sk-or-v1-YOUR_OPENROUTER_API_KEY_HERE"
-      }
+      "command": "npx",
+      "args": [
+        "-y",
+        "supergateway",
+        "--sse",
+        "https://icd10-mcp.onrender.com/sse",
+        "--header",
+        "X-OpenRouter-API-Key: sk-or-v1-YOUR_OPENROUTER_API_KEY_HERE"
+      ]      
     }
   }
 }

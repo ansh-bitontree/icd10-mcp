@@ -1,471 +1,502 @@
 # ICD-10-CM MCP Server
 
-A Model Context Protocol (MCP) server that provides ICD-10-CM medical coding tools for Claude Desktop, LangGraph, and web applications.
+A Model Context Protocol (MCP) server that provides AI agents with accurate ICD-10-CM medical coding capabilities through a 3-stage RAG pipeline.
 
-**🚀 New to this? Start with the [Quick Start Guide](QUICKSTART.md)**
+---
 
-## What it does
+## What Is This Project?
 
-This server exposes two powerful tools for medical coding:
+This is an **ICD-10-CM MCP (Model Context Protocol) server** that lets any AI agent, Claude Desktop, LangGraph agent, or web application look up and assign accurate ICD-10-CM billing codes from plain-English clinical notes or medical queries.
 
-| Tool | Description | Use Case | Speed |
-|---|---|---|---|
-| `code_clinical_note` | Full 3-stage RAG pipeline: extracts clinical problems, retrieves matching codes, and selects the most accurate ICD-10 codes with rationale | Clinical notes, discharge summaries, lab reports | ~15-30s |
-| `search_icd10` | Fast semantic vector search for ICD-10 codes | Quick lookups for specific conditions or symptoms | ~2-3s |
+ICD-10-CM codes are the standardized diagnostic codes used in healthcare for insurance claims, medical records, and billing. Instead of manually searching through massive code books, AI agents can use this server to:
 
-## 🚀 Quick Start - Use the Deployed Server
+- **Search for codes** using natural language medical terms
+- **Automatically code clinical notes** by extracting diagnoses and matching them to the most accurate ICD-10 codes with clinical rationale
 
-The easiest way to use this MCP server is to connect to the deployed instance. You only need your own OpenRouter API key.
+### The Two Tools
 
-**Deployed Server URL**: `https://icd10-mcp.onrender.com`
+This server exposes two tools that any MCP-compatible AI agent can call:
 
-**Quick Config**: Copy `claude_desktop_config_example.json` and add your OpenRouter API key.
+l 3-Stage RAG Pipeline
 
-### For Claude Desktop Users
+**What it does:** Takes a complete clinical note (lab report, discharge summary, progress note) and returns structured ICD-10 codes with rationale.
 
-1. **Get your OpenRouter API key** from https://openrouter.ai/
+**When to use:** You have a full clinical document and need accurate billing codes.
 
-2. **Open your Claude Desktop config file:**
-   - **Mac**: `~/Library/Application Support/Claude/claude_desktop_config.json`
-   - **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+**Speed:** ~15-30 seconds (calls LLM twice: planner + selector)
 
-3. **Add this configuration** (merge into existing `mcpServers` if you have others):
+**Example:**
+```
+Input: Lab report showing elevated glucose, HbA1c 9.2%, creatinine 2.1, eGFR 38
+Output: 
+  - E11.22 (Type 2 diabetes mellitus with diabetic chronic kidney disease)
+  -ic kidney disease, stage 3)
+  - Clinical rationale for each code selection
+```
+
+#### 2. `search_icd10` — Fast Semantic Vector Search
+
+**What it does:** Takes a plain-English medical query and returns the top matching ICD-10 codes.
+
+**When to use:** Quick lookups when you know the condition but need the code.
+
+**Speed:** ~2-3 seconds
+
+**Example:**
+```
+Query: "type 2 diabetes with chronic kidney disease"
+Returns: E11.22, E11.9, N18.3, etc. with descriptions and relevance scores
+```
+
+---
+
+lly — The RAG Pipeline
+
+The `code_clinical_note` tool uses a **3-stage RAG (Retrieval-Augmented Generation) pipeline** to ensure accurate, clinically-sound ICD-10-CM code assignment.
+
+### Stage 1 — Planner (`planner.py`)
+
+**Goal:** Extract clinical problems from the note and generate optimized search queries.
+
+**How it works:**
+
+1. Takes the raw clinical note as input
+2. Sends it to an LLM via OpenRouter (default: `openai/gpt-4o-mini`) with a detailed system prompt that acts as a "clinical query planner"
+3. The LLM analyzes the note and extracts a structured list of clinical problems
+   - Example problem", "Anemia in CKD"
+4. For each problem, the LLM generates 2–4 semantic search queries optimized for matching ICD-10-CM code titles in a vector database
+   - Example queries for "Type 2 diabetes with CKD": 
+     - "type 2 diabetes mellitus with diabetic chronic kidney disease"
+     - "T2DM with renal complications"
+     - "diabetes mellitus type 2 with nephropathy"
+5. Returns structured JSON:
+   ```json
+   {
+     "problems": [
+       {
+         "problem": "Type 2 diabetes mellitus with chronic kidney disease",
+         "confidence": "high",
+         "queries": ["...", "...", "..."]
+       }
+     ]
+   }
+   ```
+
+**Why this matters:** The planner ensures we search for the right things. A raw clinical note might say "elevated HbA1c 9.2% with reduced eGFR 38" — the planner translates this into proper medical terminology that matches ICD-10 code descriptions.
+
+### Stage 2 — Retriever (`retriever.py`)
+
+**Goal:** Find the best candidate ICD-10 codes for each clinical problem using vector search and ranking fusion.
+
+it works:**
+
+1. **Batch Embedding:** Takes all queries from the planner (across all problems) and batch-embeds them in a single API call to OpenRouter (default: `openai/text-embedding-3-small`)
+   - This is much faster than embedding queries one-by-one
+
+2. **Vector Search:** For each problem, runs multiple Pinecone vector queries (one per query generated by the planner)
+   - Each query retrieves `top_k=16` results from the Pinecone index
+   - The Pinecone index contains pre-embedded ICD-10-CM ctadata)
+
+3. **Reciprocal Rank Fusion (RRF):** Combines results from multiple queries using RRF scoring
+   - RRF formula: `score = Σ(1 / (k + rank))` where `k=60`
+   - This ensures codes that appear in multiple query results get boosted
+
+4. **Lexical Re-ranking:** Adds a lexical similarity score to catch exact term matches
+   - Token overlap: measures how many words from the query appear in the code title
+   - SequenceMatcher: measures character-level similarity
+   - Final score: `75% RRF + 25% lexical`
+
+5. **De-duplication:** Returns up to 40 unique candidate codes per problem, sorted by final score
+
+**Why this matters:** A single query might miss relevant codes. By generating multiple queries and fusing results, we cast a wider net while still prioritizing the most relevant codes. The lexical re-ranking ensures we don't miss codes with exact terminology matches.
+
+### Stage 3 — Selector (`selector.py`)
+
+**Goal:** Select the most accurate ICD-10 codes from the candidates using clinical coding rules.
+
+**How it works:**
+
+1. Takes the original clinical note + all candidate codes per problem
+2. Sends everything to an LLM via OpenRouter (default: `openai/gpt-4o-mini`) with a strict system prompt that applies ICD-10-CM coding rules:
+   - **Prefer most-specific combination codes** (e.g., E11.22 over E11.9 + N18.3)
+   - **Enforce etiology-manifestation coding** (code the underlying cause first)
+   - **Drop parent codes when child codes are present** (e.g., if E11.22 is selected, don't also include E11)
+ codes across problems** (each code appears only once)
+   - **Avoid "unspecified" codes when specific codes are available**
+3. The LLM reviews each candidate and decides whether to include it, providing clinical rationale
+4. Returns final selected codes with rationale per problem:
+   ```json
+   {
+     "results": [
+       {
+         "problem": "Type 2 diabetes with CKD",
+         "selected_codes": [
+           {
+             "code": "E11.22",
+             "title": "Type 2 diabetes mellitus disease",
+             "rationale": "Combination code captures both diabetes and CKD relationship"
+           }
+         ]
+       }
+     ]
+   }
+   ```
+
+**Why this matters:** Vector search alone can return too many codes or miss coding rules. The selector applies clinical expertise to choose the right codes and explain why, ensuring the output is billable and clinically accurate.
+
+### MCP Protocol Layer (`server.py`)
+
+**Goal:** Expose the pipeline as MCP tools that any AI agent can call.
+
+**How it works:**
+
+- Built on the `mcp` Python SDK
+- Supports **two transports**:
+  - **stdio** — for local Claude Desktop use (no network, runs as subprocess)
+  - **HTTP/SSE** — for remote use by LangGraph, web apps, agents, n8n, etc.
+- **Per-request OpenRouter API key injection** via `X-OpenRouter-API-Key` header
+  - Users bring their own OpenRouter key; the server never stores it
+  - This allows the hosted server to be used by anyone without exposing API keys
+- **Health check endpoint** at `/health` for monitoring and uptime checks
+
+**Architecture:**
+
+```
+Client (Claude Desktop, LangGraph, etc.)
+    │
+    ▼
+MCP Server (stdio or HTTP/SSE)
+    │
+    ├─► Planner ──► OpenRouter LLM (extract problems + queries)
+    │
+    ├─► Retriever ──► OpenRouter Embeddings + Pinecone (vector search + RRF)
+    │
+    └─► Selector ──► OpenRouter LLM (select codes + rationale)
+```
+
+---
+
+## Prerequisites
+
+Before using this MCP server, you need:
+
+1. **Python 3.10 or higher** installed on your system
+
+   - Index name: `icd10cm-2026`
+   - Namespace: `icd10cm_2026`
+   - The index should contain embedded ICD-10-CM codes with metadata (code, title, parent_code, level)
+3. **An OpenRouter API key** — get one at [openrouter.ai](https://openrouter.ai/)
+4. **Environment variables** (for local/self-hosted use):
+   - `PINECONE_API_KEY` — your Pinecone API key
+   - `PINECONE_INDEX_NAME` — default: `icd10cm-2026`
+   - `PINECONE_NAMESPACE` — default: `icd10cm_2026`
+   - `OPENROUTER_API_KEY` — your OpenRouter API key
+
+---
+
+## Integration Examples — How to Use This MCP Server
+
+This server can be integrated with any MCP-compatible AI agent or application. Below are integration guides for common use cases.
+
+### A. Claude Desktop (Remote Hosted Server)
+
+Connect Claude Desktop to the hosted server at `https://icd10-mcp.onrender.com/sse` using the `supergateway` bridge.
+
+**Step 1:** Copy the configuration from `claude_desktop_config_example.json`:
 
 ```json
 {
   "mcpServers": {
     "icd10-mcp": {
-      "url": "https://icd10-mcp.onrender.com/sse",
-      "transport": "sse",
-      "headers": {
-        "X-OpenRouter-API-Key": "sk-or-v1-your-key-here"
-      }
+      "command": "npx",
+      "args": [
+        "-y",
+        "supergateway",
+        "--sse",
+        "https://icd10-mcp.onrender.com/sse",
+        "--header",
+        "X-OpenRouter-API-Key: sk-or-v1-YOUR_OPENROUTER_API_KEY_HERE"
+      ]      
     }
   }
 }
 ```
 
-4. **Restart Claude Desktop** and look for the 🔨 tools icon
+**Step 2:** Locate your Claude Desktop config file:
+- **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
 
-**Note**: If the deployed server is not available or you prefer to run locally, see the "Self-Hosting" section below.
+**Step 3:** Add the configuration to your Claude Desktop config file (merge with existing `mcpServers` if you have others)
 
-### For LangGraph / Python Applications
+**Step 4:** Replace `sk-or-v1-YOUR_OPENROUTER_API_KEY_HERE` with your actual OpenRouter API key
+
+**Step 5:** Restart Claude Desktop
+
+**Step 6:** Test it by asking Claude:
+> "Search for ICD-10 codes for hypertension with heart disease"
+
+**How it works:**
+- `supergateway` is an NPM package that bridges SSE (Server-Sent Events) to stdio
+- Your OpenRouter API key is sent in the `X-OpenRouter-API-Key` header with each request
+- The hosted server at `https://icd10-mcp.onrender.com/sse` handles the requests
+- No need to run anything locally — the server is always available
+
+### B. LangGraph Agent
+
+Connect a LangGraph agent to the hosted MCP server using the `langchain-mcp-adapters` package.
+
+**Installation:**
+```bash
+pip install langchain-mcp-adapters
+```
+
+**Example Code:**
 
 ```python
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+from langchain_mcp_adapters.client import MultiServerMCPClient
+import asyncio
 
-# Option 1: Connect to deployed server via SSE
-import httpx
-
-async def use_deployed_server():
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            "https://icd10-mcp.onrender.com/messages/",
-            headers={
-                "X-OpenRouter-API-Key": "sk-or-v1-your-key-here",
-                "Content-Type": "application/json"
-            },
-            json={
-                "jsonrpc": "2.0",
-                "method": "tools/call",
-                "params": {
-                    "name": "code_clinical_note",
-                    "arguments": {
-                        "note": "Patient with type 2 diabetes and CKD stage 3",
-                        "max_codes_per_problem": 2
-                    }
-                },
-                "id": 1
+async def create_icd10_agent():
+    """Create a LangGraph agent with ICD-10 MCP tools."""
+    
+    # Connect to the hosted MCP server
+    client = MultiServerMCPClient({
+        "icd10-mcp": {
+    /sse",
+            "transport": "sse",
+            "headers": {
+                "X-OpenRouter-API-Key": "sk-or-v1-YOUR_OPENROUTER_API_KEY_HERE"
             }
-        )
-        return response.json()
+        }
+    })
+    
+    # Get available tools
+    tools = await client.get_tools()
+    print(f"Available tools: {[t.name for t in tools]}")
+    
+    # Call a tool
+    result = await client.call_tool(
+        "search_icd10",
+        arguments={"query": "type 2 diabetes", "top_k": 5}
+    )
+    print(f"Results: {result}")
+    
+    # Use tools in t
+    # ... your LangGraph state machine code here ...
+    
+    return client
 
-# Option 2: Use local MCP client
-async def use_local_server():
-    server_params = StdioServerParameters(
-        command="python",
-        args=["-m", "icd10_mcp.server"],
-        env={
-            "OPENROUTER_API_KEY": "sk-or-v1-your-key-here",
-            "PINECONE_API_KEY": "your-pinecone-key",
-            "PINECONE_INDEX_NAME": "icd10cm-2026",
-            "PINECONE_NAMESPACE": "icd10cm_2026"
+# Run the agent
+asyncio.run(create_icd10_agent())
+```
+
+**Using with LangGraph State Machine:**
+
+```python
+from langgraph.graph import StateGraph, END
+from typing import TypedDict
+
+class AgentState(TypedDict):
+    clinical_note: str
+    icd_codes: list
+
+async def code_note_node(state: AgentState):
+    """Node that calls the ICD-10 MCP server."""
+    client = MultiServerMCPClient({
+        "icd10-mcp": {
+            "url": "https://icd10-mcp.onrender.com/sse",
+            "transport": "sse",
+            "headers": {"X-OpenRouter-API-Key": "sk-or-v1-YOUR_KEY"}
+        }
+    })
+    
+    result = await client.call_tool(
+        "code_clinical_note",
+        arguments={
+            "note": state["clinical_note"],
+            "max_codes_per_problem": 2
         }
     )
     
-    async with stdio_client(server_params) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            
-            # Call the tool
-            result = await session.call_tool(
-                "code_clinical_note",
-                arguments={
-                    "note": "Patient with type 2 diabetes and CKD stage 3",
-                    "max_codes_per_problem": 2
-                }
-            )
-            return result
+    return {"icd_codes": result}
+
+# Build the graph
+workflow = StateGraph(AgentState)
+workflow.add_node("code_note", code_note_node)
+workflow.set_entry_point("code_note")
+dd_edge("code_note", END)
+
+app = workflow.compile()
 ```
 
-### For Web Applications (JavaScript/TypeScript)
+### D. Direct HTTP / Any Web App or Backend
+
+Call the MCP server directly via HTTP/SSE from any programming language.
+
+**Server Details:**
+- **Base URL:** `https://icd10-mcp.onrender.com`
+- **SSE Endpoint:** `GET /sse` (for MCP protocol connection)
+- **Messages Endpoint:** `POST /messages/` (for tool calls)
+- **Health Check:** `GET /health`
+- **Required Header:** `X-OpenRouter-API-Key: sk-or-v1-YOUR_OPENROUTER_API_KEY`
+
+#### Python Example (using `requests`):
+
+```python
+import requests
+import json
+
+MCP_SERVER_URL = "https://icd10-mcp.onrender.com"
+OPENROUTER_API_KEY = "sk-or-v1-YOUR_KEY"
+
+# Health check
+response = requests.get(f"{MCP_SERVER_URL}/health")
+print(response.json())
+
+# Call search_icd10 tool
+response = requests.post(
+    f"{MCP_SERVER_URL}/messages/",
+    json={
+        "method": "tools/call",
+        "params": {
+            "name": "search_icd10",
+            "arguments": {"query": "hypertension", "top_k": 5}
+        }
+    },
+    headers={
+        "X-OpenRouter-API-Key": OPENROUTER_API_KEY,
+        "Content-Type": "application/json"
+    }
+)
+
+result = response.json()
+print(json.dumps(result, indent=2))
+
+# Call code_clinical_note tool
+clinical_note = """
+Patient presents with elevated blood pressure 158/96 mmHg.
+History of type 2 diabetes, HbA1c 9.2%.
+Creatinine 2.1 mg/dL, eGFR 38 mL/min.
+"""
+
+response = requests.post(
+    f"{MCP_SERVER_URL}/messages/",
+    json={
+        "method": "tools/call",
+        "params": {
+            "name": "code_clinical_note",
+            "arguments": {
+                "note": clinical_note,
+                "max_codes_per_problem": 2
+            }
+        }
+    },
+    headers={
+        "X-OpenRouter-API-Key": OPENROUTER_API_KEY,
+        "Content-Type": "application/json"
+    }
+)
+
+result = response.json()
+print(json.dumps(result, indent=2))
+```
+
+#### JavaScript Example (using `fetch`):
 
 ```javascript
-// Using fetch API to call MCP tools
-async function codeClinicNote(clinicalNote) {
-  const response = await fetch('https://icd10-mcp.onrender.com/messages/', {
-    method: 'POST',
-    headers: {
-      'X-OpenRouter-API-Key': 'sk-or-v1-your-key-here',
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      method: 'tools/call',
-      params: {
-        name: 'code_clinical_note',
-        arguments: {
-          note: clinicalNote,
-          max_codes_per_problem: 2
-        }
-      },
-      id: 1
-    })
-  });
-  
-  return await response.json();
-}
+const MCP_SERVER_URL = "https://icd10-mcp.onrender.com";
+const OPENROUTER_API_KEY = "sk-or-v1-YOUR_KEY";
 
-// Example usage
-const result = await codeClinicNote(
-  "Patient presents with type 2 diabetes mellitus with diabetic nephropathy, stage 3 CKD"
-);
-console.log(result);
+// Health check
+fetch(`${MCP_SERVER_URL}/health`)
+  .then(res => res.json())
+  .then(data => console.log(data));
 
-// Search for ICD-10 codes
-async function searchICD10(query) {
-  const response = await fetch('https://icd10-mcp.onrender.com/messages/', {
-    method: 'POST',
-    headers: {
-      'X-OpenRouter-API-Key': 'sk-or-v1-your-key-here',
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      method: 'tools/call',
-      params: {
-        name: 'search_icd10',
-        arguments: {
-          query: query,
-          top_k: 10
-        }
-      },
-      id: 2
-    })
-  });
-  
-  return await response.json();
-}
-```
-
-### Using with n8n Workflow Automation
-
-1. Add an **HTTP Request** node
-2. Set the URL to: `https://icd10-mcp.onrender.com/messages/`
-3. Method: `POST`
-4. Add header: `X-OpenRouter-API-Key` with your key
-5. Body (JSON):
-```json
-{
-  "jsonrpc": "2.0",
-  "method": "tools/call",
-  "params": {
-    "name": "code_clinical_note",
-    "arguments": {
-      "note": "{{$json.clinical_note}}",
-      "max_codes_per_problem": 2
-    }
+// Call search_icd10 tool
+fetch(`${MCP_SERVER_URL}/messages/`, {
+  method: "POST",
+  headers: {
+    "X-OpenRouter-API-Key": OPENROUTER_API_KEY,
+    "Content-Type": "application/json"
   },
-  "id": 1
-}
-```
+  body: JSON.stringify({
+    method: "tools/call",
+    params: {
+      name: "search_icd10",
+      arguments: { query: "diabetes", top_k: 5 }
+    }
+  })
+})
+  .then(res => res.json())
+  .then(data => console.log(data));
 
-## 💻 Self-Hosting (Advanced)
+// Call code_clinical_note tool
+const clinicalNote = `
+Patient presents with elevated blood pressure 158/96 mmHg.
+History of type 2 diabetes, HbA1c 9.2%.
+Creatinine 2.1 mg/dL, eGFR 38 mL/min.
+`;
 
-If you want to run your own instance locally or deploy your own server:
-
-### Prerequisites
-
-- Python 3.10+
-- OpenRouter API key (get yours at https://openrouter.ai/)
-- Pinecone account with ICD-10-CM embeddings index
-
-### Local Installation
-
-```bash
-# Clone the repository
-git clone <repository-url>
-cd icd10_mcp
-
-# Install dependencies
-pip install -e .
-
-# Create .env file
-touch .env
-```
-
-Edit `.env` and add your API keys:
-```env
-# Pinecone Configuration
-PINECONE_API_KEY=your_pinecone_api_key_here
-PINECONE_INDEX_NAME=icd10cm-2026
-PINECONE_NAMESPACE=icd10cm_2026
-
-# OpenRouter Configuration
-OPENROUTER_API_KEY=your_openrouter_api_key_here
-
-# Model Configuration
-PLANNER_MODEL=openai/gpt-4o-mini
-SELECTOR_MODEL=openai/gpt-4o-mini
-EMBED_MODEL=openai/text-embedding-3-small
-```
-
-### Test Your Local Installation
-
-```bash
-python scripts/test_tools.py
-```
-
-All tools should show ✅ before proceeding.
-
-### Run Locally
-
-**For Claude Desktop (stdio mode):**
-```bash
-python -m icd10_mcp.server
-```
-
-**For web/API access (HTTP/SSE mode):**
-```bash
-python -m icd10_mcp.server --http
-```
-
-### Connect Claude Desktop to Local Server
-
-Edit your Claude Desktop config:
-
-```json
-{
-  "mcpServers": {
-    "icd10-mcp-local": {
-      "command": "python",
-      "args": ["-m", "icd10_mcp.server"],
-      "cwd": "/absolute/path/to/icd10_mcp",
-      "env": {
-        "PINECONE_API_KEY": "your_pinecone_api_key_here",
-        "PINECONE_INDEX_NAME": "icd10cm-2026",
-        "PINECONE_NAMESPACE": "icd10cm_2026",
-        "OPENROUTER_API_KEY": "your_openrouter_api_key_here",
-        "PLANNER_MODEL": "openai/gpt-4o-mini",
-        "SELECTOR_MODEL": "openai/gpt-4o-mini",
-        "EMBED_MODEL": "openai/text-embedding-3-small"
+fetch(`${MCP_SERVER_URL}/messages/`, {
+  method: "POST",
+  headers: {
+    "X-OpenRouter-API-Key": OPENROUTER_API_KEY,
+    "Content-Type": "application/json"
+  },
+  body: JSON.stringify({
+    method: "tools/call",
+    params: {
+      name: "code_clinical_note",
+      arguments: {
+        note: clinicalNote,
+        max_codes_per_problem: 2
       }
     }
-  }
-}
+  })
+})
+  .then(res => res.json())
+  .then(data => console.log(data));
 ```
 
-### Deploy Your Own Instance on Render
+### E. Any AI Agent (Generic MCP Client)
 
-1. Fork this repository to your GitHub account
-2. Create a new Web Service on [Render](https://render.com)
-3. Connect your forked repository
-4. Render will automatically detect `render.yaml` and configure the service
-5. Add these environment variables in the Render dashboard:
-   - `PINECONE_API_KEY` - Your Pinecone API key
-   - `OPENROUTER_API_KEY` - Your OpenRouter API key
-   - `PINECONE_INDEX_NAME` - (optional, defaults to icd10cm-2026)
-   - `PINECONE_NAMESPACE` - (optional, defaults to icd10cm_2026)
+Any MCP-compatible client can connect to this server using SSE (Server-Sent Events) transport.
 
-Your server will be available at: `https://your-app-name.onrender.com`
+**Connection Details:**
+- **URL:** `https://icd10-mcp.onrender.com/sse`
+- **Transport:** SSE (Server-Sent Events)
+- **Required Header:** `X-OpenRouter-API-Key: sk-or-v1-YOUR_OPENROUTER_API_KEY`
+- **Tools Available:** `code_clinical_note`, `search_icd10`
 
-**Note**: Users connecting to your deployed server will need to provide their own OpenRouter API key in the request headers.
+**Generic Pattern:**
 
-## Project structure
+```python
+import requests
 
-```
-icd10_mcp/
-├── src/
-│   └── icd10_mcp/
-│       ├── __init__.py
-│       ├── server.py            ← MCP server (entry point)
-│       ├── planner.py           ← Stage 1: extract clinical problems
-│       ├── retriever.py         ← Stage 2: Pinecone RRF search
-│       ├── selector.py          ← Stage 3: LLM code selection
-│       └── openrouter_client.py ← Shared API client
-├── scripts/
-│   └── test_tools.py            ← Smoke test all 3 tools
-├── pyproject.toml
-├── Dockerfile
-├── claude_desktop_config.json   ← Paste into Claude Desktop config
-└── README.md
+# Connect to SSE endpoint
+response = requests.get(
+    "https://icd10-mcp.onrender.com/sse",
+    headers={"X-OpenRouter-API-Key": "sk-or-v1-YOUR_KEY"},
+    stream=True
+)
+
+# The server will send MCP protocol messages via SSE
+# Your client should parse SSE events and handle MCP JSON-RPC messages
 ```
 
-## 📖 Usage Examples
+---
 
-### In Claude Desktop
+## Environment Variables Reference
 
-Once connected, you can ask Claude:
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `PINECONE_API_KEY` | **Yes** | — | Your Pinecone API key |
+| `PINECONE_INDEX_NAME` | No | `icd10cm-2026` | Name of your Pinecone index |
+| `PINECONE_NAMESPACE` | No | `icd10cm_2026` | Namespace within the Pinecone index |
+| `OPENROUTER_API_KEY` | **Yes*** | — | Your OpenRouter API key |
+| `PLANNER_MODEL` | No | `openai/gpt-4o-mini` | LLM model for the planner stage |
+| `SELECTOR_MODEL` | No | `openai/gpt-4o-mini` | LLM model for the selector stage |
+| `EMBED_MODEL` | No | `openai/text-embedding-3-small` | Embedding model for vector search |
+| `PORT` | No | `8000` | Port for HTTP/SSE server (HTTP mode only) |
 
-> *"Here is a clinical note, please code it with ICD-10:"*
-> 
-> ```
-> Patient presents with type 2 diabetes mellitus with diabetic nephropathy, 
-> stage 3 chronic kidney disease, and uncontrolled hypertension.
-> ```
-
-Claude will call `code_clinical_note` and return structured ICD-10 codes with rationale.
-
-> *"What ICD-10 codes exist for COPD with acute exacerbation?"*
-
-Claude will call `search_icd10` for a quick lookup.
-
-### Direct API Usage
-
-**Code a clinical note:**
-```bash
-curl -X POST https://your-deployed-server.onrender.com/messages/ \
-  -H "Content-Type: application/json" \
-  -H "X-OpenRouter-API-Key: your_key_here" \
-  -d '{
-    "tool": "code_clinical_note",
-    "arguments": {
-      "note": "Patient with type 2 diabetes and CKD stage 3",
-      "max_codes_per_problem": 2
-    }
-  }'
-```
-
-**Search for ICD-10 codes:**
-```bash
-curl -X POST https://your-deployed-server.onrender.com/messages/ \
-  -H "Content-Type: application/json" \
-  -H "X-OpenRouter-API-Key: your_key_here" \
-  -d '{
-    "tool": "search_icd10",
-    "arguments": {
-      "query": "essential hypertension",
-      "top_k": 10
-    }
-  }'
-```
-
-## Architecture
-
-```
-Clinical Note
-     │
-     ▼
- [Planner]  ─── LLM (gpt-4o-mini) extracts problems + builds smart queries
-     │
-     ▼
- [Retriever] ── Pinecone vector search + RRF fusion + lexical re-ranking
-     │
-     ▼
- [Selector]  ── LLM (gpt-4o-mini) selects best codes with rationale
-     │
-     ▼
- ICD-10 Codes returned to Claude Desktop
-```
-
-## 🔑 API Key Management
-
-### Where to Get API Keys
-
-1. **OpenRouter API Key** (Required for all users)
-   - Sign up at https://openrouter.ai/
-   - Go to Keys section
-   - Create a new API key
-   - Add credits to your account (pay-as-you-go)
-
-2. **Pinecone API Key** (Only required if self-hosting)
-   - Sign up at https://www.pinecone.io/
-   - Create a new project
-   - Get your API key from the dashboard
-
-### Cost Estimates (OpenRouter)
-
-Using the default models:
-- `code_clinical_note`: ~$0.01-0.03 per clinical note
-- `search_icd10`: ~$0.001-0.002 per search
-
-Costs depend on note length and complexity. See https://openrouter.ai/models for current pricing.
-
-## ❓ FAQ
-
-**Q: Do I need to deploy my own server?**
-A: No! You can use the deployed server at `https://icd10-mcp.onrender.com` with just your OpenRouter API key.
-
-**Q: Is my data secure?**
-A: Clinical notes are processed in real-time and not stored. They're sent to OpenRouter's API for LLM processing. Review OpenRouter's privacy policy for details.
-
-**Q: Can I use different LLM models?**
-A: Yes! If self-hosting, you can change `PLANNER_MODEL` and `SELECTOR_MODEL` to any model available on OpenRouter.
-
-**Q: What if the deployed server is slow or down?**
-A: Render's free tier may have cold starts (10-30s delay). For production use, consider self-hosting or upgrading to a paid Render plan.
-
-**Q: Can I use this for commercial purposes?**
-A: Check the license file. For the OpenRouter API, review their terms of service.
-
-## 🐛 Troubleshooting
-
-### Claude Desktop doesn't show the tools
-
-1. Check that your config file is valid JSON (use a JSON validator)
-2. Ensure the server URL is correct and accessible
-3. Verify your OpenRouter API key is valid
-4. Restart Claude Desktop completely (quit and reopen)
-5. Check Claude Desktop logs:
-   - Mac: `~/Library/Logs/Claude/`
-   - Windows: `%APPDATA%\Claude\logs\`
-
-### "OpenRouter API key is required" error
-
-- Make sure you've added the `X-OpenRouter-API-Key` header
-- Verify your API key starts with `sk-or-v1-`
-- Check that you have credits in your OpenRouter account
-
-### "Pinecone connection failed" error
-
-- This means the server's Pinecone configuration is incorrect
-- If using the deployed server, contact the server administrator
-- If self-hosting, verify your `PINECONE_API_KEY` and index name
-
-### Slow response times
-
-- First request may be slow due to cold start (Render free tier)
-- Subsequent requests should be faster
-- Consider self-hosting for consistent performance
-
-### Tools return empty results
-
-- Ensure your clinical note contains actual medical conditions
-- Try the `search_icd10` tool first to verify the system is working
-- Check that the Pinecone index contains ICD-10 data
-
-## 📝 License
-
-[Add your license here]
-
-## 🤝 Contributing
-
-Contributions are welcome! Please open an issue or submit a pull request.
-
-## 📧 Support
-
-For issues or questions:
-- Open a GitHub issue
-- Check the troubleshooting section above
-- Review MCP documentation: https://modelcontextprotocol.io/
+**\*Note:** `OPENROUTER_API_KEY` is required for HTTP/SSE mode. Users provide their OpenRouter key via the `X-OpenRouter-API-Key` header with each request.
